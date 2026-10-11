@@ -12,17 +12,13 @@ from langchain_openai import ChatOpenAI
 @tool
 def add(a: int, b: int) -> int:
     """Add two integers."""
-    result = a + b
-    print(f"Tool called: add({a}, {b}) = {result}")
-    return result
+    return a + b
 
 
 @tool
 def multiply(a: int, b: int) -> int:
     """Multiply two integers."""
-    result = a * b
-    print(f"Tool called: multiply({a}, {b}) = {result}")
-    return result
+    return a * b
 
 
 def main() -> None:
@@ -47,7 +43,9 @@ def main() -> None:
         {"messages": [{"role": "user", "content": "Calculate (2 + 3) * 5"}]},
         config={"recursion_limit": 10},
     )
-    print("AI answer:", response["messages"][-1].content)
+    for index, message in enumerate(response["messages"], start=1):
+        print(f"\nMessage {index}")
+        message.pretty_print()
 
 
 if __name__ == "__main__":

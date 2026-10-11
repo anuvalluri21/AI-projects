@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
@@ -25,10 +24,13 @@ def main() -> None:
         max_retries=0,
     )
 
-    # LangChain passes the prompt to the model, then extracts its text response.
-    chain = prompt | model | StrOutputParser()
-    answer = chain.invoke({"expression": "(2 + 3) * 5"})
-    print(answer)
+    # Keep the message objects so the full exchange can be printed in order.
+    prompt_value = prompt.invoke({"expression": "(2 + 3) * 5"})
+    answer = model.invoke(prompt_value)
+    messages = [*prompt_value.to_messages(), answer]
+    for index, message in enumerate(messages, start=1):
+        print(f"\nMessage {index}")
+        message.pretty_print()
 
 
 if __name__ == "__main__":
