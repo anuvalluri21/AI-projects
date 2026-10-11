@@ -33,6 +33,9 @@ parsing or evaluating an arithmetic expression.
 This script prints the system prompt, human request, and AI response. It has no
 tool calls or tool-result messages.
 
+A successful run will print these three messages in order (the AI response
+below is an example):
+
 ```text
 Message 1 — System
 Calculate the expression. Show brief calculation steps and the final answer.
@@ -50,6 +53,15 @@ The system and human text above match the code. The AI response is an example,
 not a captured live response. `pretty_print()` displays message-type headers.
 
 ## `ai_calculator.py`
+
+After a successful run, it typically prints these messages in order:
+
+1. **User:** `Calculate (2 + 3) * 5`
+2. **AI tool call:** `add(a=2, b=3)`
+3. **Tool result:** `5`
+4. **AI tool call:** `multiply(a=5, b=5)`
+5. **Tool result:** `25`
+6. **AI final answer:** for example, `(2 + 3) * 5 = 25`
 
 This script prints the returned conversation messages: human request, AI tool
 calls, tool results, and final AI answer. Its system prompt is not included in
