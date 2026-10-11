@@ -4,6 +4,30 @@ Both scripts print numbered messages in order after a successful AI response.
 The examples below illustrate the output; AI wording, tool-call IDs, and the
 agent's number of messages may vary. Both scripts require `OPENAI_API_KEY`.
 
+## Differences between the scripts
+
+| Feature | `ai_calculator.py` | `langchain_ai_math.py` |
+| --- | --- | --- |
+| Approach | AI agent with Python arithmetic tools | Prompt passed directly to an AI model |
+| Who calculates? | AI selects tool calls; Python performs addition and multiplication | AI produces the calculation steps and answer directly |
+| Execution flow | Can involve several model calls and tool executions | One model invocation |
+| Tools | `add` and `multiply` | No tools |
+| Printed messages | Human request, AI tool calls, tool results, and final AI answer | System prompt, human request, and AI response |
+| System prompt printed? | No; it is not in the returned conversation list | Yes |
+| Output timing | All returned messages print after the agent finishes | All messages print after the model responds |
+| Inspectability | Shows tool arguments, call IDs, and Python results | Shows the calculation steps written by the AI |
+| Model | `gpt-4.1-mini` | `gpt-4.1-mini` |
+| API key required? | Yes | Yes |
+
+For `(2 + 3) * 5`, the agent typically requests `add(2, 3)` and then
+`multiply(5, 5)`. The direct model script generates the answer as text.
+Python tools compute their supplied arguments deterministically, but the AI
+still chooses the operations and arguments.
+
+The updated `langchain_ai_math.py` keeps the AI message object for printing.
+It no longer uses `StrOutputParser`, which extracts response text rather than
+parsing or evaluating an arithmetic expression.
+
 ## `langchain_ai_math.py`
 
 This script prints the system prompt, human request, and AI response. It has no
