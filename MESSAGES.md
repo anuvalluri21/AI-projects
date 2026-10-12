@@ -28,6 +28,31 @@ The updated `langchain_ai_math.py` keeps the AI message object for printing.
 It no longer uses `StrOutputParser`, which extracts response text rather than
 parsing or evaluating an arithmetic expression.
 
+## Start and end nodes
+
+`ai_calculator.py` does not explicitly define start or end nodes.
+`create_agent()` builds a LangGraph workflow internally, managing model calls,
+tool execution, and when to finish.
+
+In `calculator.py`, the graph is built explicitly with these connections:
+
+```text
+START → add_step → multiply_step → END
+```
+
+In `ai_calculator.py`, the agent manages a flow like this:
+
+```text
+START → AI → tools → AI → … → END
+```
+
+The agent finishes when the AI returns a response without requesting more
+tools. For `(2 + 3) * 5`, it typically calls `add(2, 3)`, receives `5`, then
+calls `multiply(5, 5)`, receives `25`, and produces its final answer.
+
+`langchain_ai_math.py` uses a prompt and a single model invocation; it does not
+explicitly build a graph or execute arithmetic tools.
+
 ## `langchain_ai_math.py`
 
 This script prints the system prompt, human request, and AI response. It has no
