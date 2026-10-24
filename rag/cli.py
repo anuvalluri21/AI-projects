@@ -20,11 +20,15 @@ async def main():
     parser.add_argument("--page-workers", type=int, default=5)
     parser.add_argument("--chunk-workers", type=int, default=8)
     parser.add_argument("--embedding-model", default="text-embedding-3-small")
+    parser.add_argument("--render-dpi", type=int, default=120)
+    parser.add_argument("--entity-model", default="gpt-4.1-mini")
+    parser.add_argument("--skip-entities", action="store_true", help="Skip Trustcall page knowledge extraction")
     parser.add_argument("--files-only", action="store_true", help="Skip Neo4j and embeddings")
     args = parser.parse_args()
     if not args.pdf.is_file():
         parser.error("PDF file does not exist")
-    settings = Settings(args.output, args.chunk_size, args.overlap, args.page_workers, args.chunk_workers, args.embedding_model)
+    settings = Settings(args.output, args.chunk_size, args.overlap, args.page_workers, args.chunk_workers,
+                        args.embedding_model, args.render_dpi, not args.skip_entities, args.entity_model)
     settings.validate()
     stores = None
     if not args.files_only:

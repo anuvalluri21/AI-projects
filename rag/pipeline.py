@@ -7,10 +7,11 @@ from .file_store import FileStore
 from .pdf_extractor import PDFExtractor
 from .text_chunker import TextChunker
 from .page_processor import PageProcessor
+from .page_renderer import PageRenderer
 
 
 class RagPipeline:
-    def __init__(self, settings, stores=None, extractor=None, chunker=None, files=None, executor=None):
+    def __init__(self, settings, stores=None, extractor=None, chunker=None, files=None, executor=None, renderer=None):
         settings.validate()
         self.settings = settings
         self.stores = stores
@@ -18,6 +19,7 @@ class RagPipeline:
         self.chunker = chunker if chunker is not None else TextChunker(settings.chunk_size, settings.overlap)
         self.files = files if files is not None else FileStore()
         self.executor = executor if executor is not None else AsyncExecutor()
+        self.renderer = renderer if renderer is not None else PageRenderer()
 
     async def ingest(self, source):
         settings, stores = self.settings, self.stores
@@ -31,6 +33,8 @@ class RagPipeline:
             "source_path": str(snapshot), "page_count": count, "status": "ingesting",
             "chunk_size": settings.chunk_size, "overlap": settings.overlap,
             "embedding_model": settings.embedding_model,
+            "render_dpi": settings.render_dpi, "entity_extraction": bool(stores and settings.extract_entities),
+            "entity_model": settings.entity_model,
         }
         manifest = folder / "document.json"
         await asyncio.to_thread(self.files.write_json, manifest, metadata)
@@ -38,7 +42,7 @@ class RagPipeline:
 
         page_processor = PageProcessor(
             settings, stores, self.extractor, self.chunker, self.files, self.executor,
-            document_id, folder, snapshot, count, chunk_slots,
+            document_id, folder, snapshot, count, chunk_slots, self.renderer,
         )
 
         try:
@@ -73,3 +77,5 @@ class RagPipeline:
                 except Exception:
                     pass  # Preserve the original ingestion error.
             raise
+        finally:
+            await self.renderer.close()

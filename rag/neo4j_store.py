@@ -10,7 +10,7 @@ class Neo4jGraphStore:
         )
         self.database = os.getenv("NEO4J_DATABASE", "neo4j")
         await self.driver.verify_connectivity()
-        for label in ("Document", "Page", "Chunk"):
+        for label in ("Document", "Page", "Chunk", "PageEntity", "PageRelation"):
             await self.query(f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.id IS UNIQUE")
 
     async def query(self, cypher, **parameters):
@@ -34,6 +34,43 @@ class Neo4jGraphStore:
             "MERGE (d)-[:HAS_CHUNK]->(c) MERGE (p)-[:HAS_CHUNK]->(c)",
             doc=document_id, page=page_id, meta=metadata,
         )
+
+    async def page_knowledge(self, page_id, knowledge):
+        """Replace this page's extracted graph atomically, avoiding stale retry data."""
+        entities = [{**entity, "page_id": page_id, "image_path": knowledge["image_path"],
+                     "model": knowledge["model"]} for entity in knowledge["entities"]]
+        relations = [{**relation, "page_id": page_id, "image_path": knowledge["image_path"],
+                      "model": knowledge["model"]} for relation in knowledge["relationships"]]
+
+        async def replace(tx):
+            queries = [
+                ("MATCH (r:PageRelation {page_id:$page}) DETACH DELETE r", {}),
+                ("MATCH (e:PageEntity {page_id:$page}) DETACH DELETE e", {}),
+                ("MATCH (p:Page {id:$page}) UNWIND $entities AS meta "
+                 "MERGE (e:PageEntity {id:meta.id}) SET e += meta "
+                 "MERGE (p)-[:MENTIONS]->(e)", {"entities": entities}),
+                ("MATCH (p:Page {id:$page}) UNWIND $relations AS meta "
+                 "MATCH (a:PageEntity {id:meta.source_id}), (b:PageEntity {id:meta.target_id}) "
+                 "MERGE (r:PageRelation {id:meta.id}) SET r += meta "
+                 "MERGE (p)-[:HAS_RELATION]->(r) "
+                 "MERGE (r)-[:SUBJECT]->(a) MERGE (r)-[:OBJECT]->(b)", {"relations": relations}),
+            ]
+            for query, params in queries:
+                result = await tx.run(query, page=page_id, **params)
+                await result.consume()
+
+        async with self.driver.session(database=self.database) as session:
+            await session.execute_write(replace)
+
+    async def page_context(self, page_id):
+        records, _, _ = await self.query(
+            "MATCH (p:Page {id:$page}) "
+            "OPTIONAL MATCH (p)-[:MENTIONS]->(e:PageEntity) "
+            "OPTIONAL MATCH (p)-[:HAS_RELATION]->(r:PageRelation) "
+            "RETURN p{.*, entities:collect(DISTINCT e{.*}), "
+            "relationships:collect(DISTINCT r{.*})} AS context", page=page_id
+        )
+        return records[0]["context"] if records else None
 
     async def link(self, pairs):
         # Avoid oversized transactions on very large documents.

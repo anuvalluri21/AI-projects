@@ -31,6 +31,8 @@ class ChunkProcessor:
                 "page_number": number, "chunk_number": position,
                 "start_char": chunk["start"], "end_char": chunk["end"],
                 "text_path": str(chunk_path), "embedding_model": settings.embedding_model,
+                "page_image_path": str(page_folder / "page.png"),
+                "page_knowledge_path": str(page_folder / "knowledge.json"),
             }
             await asyncio.to_thread(chunk_path.write_text, chunk["text"], encoding="utf-8")
             await asyncio.to_thread(self.files.write_json, chunk_path.with_suffix(".json"), chunk_meta)

@@ -19,6 +19,7 @@ class PageProcessor:
     snapshot: Path
     count: int
     chunk_slots: asyncio.Semaphore
+    renderer: object
 
     async def process(self, index):
         settings, stores = self.settings, self.stores
@@ -29,13 +30,51 @@ class PageProcessor:
         page_folder.mkdir(parents=True, exist_ok=True)
         text_path = page_folder / "page.txt"
         await asyncio.to_thread(text_path.write_text, text, encoding="utf-8")
-        chunks = self.chunker.split(text)
+        image_path = page_folder / "page.png"
+        image_info = await self.renderer.render(snapshot, index, image_path, settings.render_dpi)
         page_id = f"{document_id}:p{number:04d}"
+        knowledge_path = page_folder / "knowledge.json"
         page_meta = {
             "id": page_id, "document_id": document_id, "page_number": number,
-            "text_path": str(text_path), "chunk_count": len(chunks),
+            "text_path": str(text_path), "image_path": str(image_path),
+            "image_width": image_info["width"], "image_height": image_info["height"],
+            "knowledge_path": str(knowledge_path), "chunk_count": 0,
+            "knowledge_status": "pending" if stores and settings.extract_entities else "skipped",
+            "text_source": "pdf_text",
             "empty_text": not bool(text.strip()),
         }
+        await asyncio.to_thread(self.files.write_json, page_folder / "page.json", page_meta)
+        if stores:
+            await stores.page(document_id, page_meta)
+
+        if stores and settings.extract_entities:
+            try:
+                knowledge = await stores.page_knowledge(page_id, image_path, text)
+                await asyncio.to_thread(self.files.write_json, knowledge_path, knowledge)
+                page_meta.update(knowledge_status="extracted",
+                                 entity_count=len(knowledge["entities"]),
+                                 relationship_count=len(knowledge["relationships"]))
+                if not text.strip() and knowledge["transcribed_text"].strip():
+                    text = knowledge["transcribed_text"]
+                    page_meta.update(text_source="vision_transcription", empty_text=False)
+                    await asyncio.to_thread(text_path.write_text, text, encoding="utf-8")
+            except Exception as error:
+                page_meta["knowledge_status"] = "failed"
+                await asyncio.to_thread(self.files.write_json, page_folder / "page.json", page_meta)
+                await asyncio.to_thread(self.files.write_json, knowledge_path,
+                                        {"page_id": page_id, "status": "failed", "error_type": type(error).__name__})
+                try:
+                    await stores.page(document_id, page_meta)
+                except Exception:
+                    pass
+                raise
+        else:
+            await asyncio.to_thread(self.files.write_json, knowledge_path,
+                                    {"page_id": page_id, "status": "skipped",
+                                     "reason": "files-only mode or --skip-entities"})
+
+        chunks = self.chunker.split(text)
+        page_meta["chunk_count"] = len(chunks)
         if stores:
             await stores.page(document_id, page_meta)
 

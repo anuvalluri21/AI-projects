@@ -14,7 +14,16 @@ from rag.text_chunker import TextChunker
 
 
 async def ingest(source, settings, stores=None):
-    return await RagPipeline(settings, stores).ingest(source)
+    return await RagPipeline(settings, stores, renderer=FakeRenderer()).ingest(source)
+
+
+class FakeRenderer:
+    async def render(self, pdf, index, destination, dpi):
+        destination.write_bytes(b"fake test image")
+        return {"width": 10, "height": 10}
+
+    async def close(self):
+        pass
 
 
 def split_text(text, size, overlap):
@@ -34,6 +43,9 @@ class FakeStores:
 
     async def page(self, document_id, metadata):
         pass
+
+    async def page_knowledge(self, page_id, image_path, text):
+        return {"entities": [], "relationships": [], "transcribed_text": "", "status": "extracted"}
 
     async def chunk(self, document_id, page_id, metadata, text):
         self.active += 1
@@ -89,13 +101,20 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             pdf = root / "fifty_pages.pdf"
             writer.write(pdf)
             with contextlib.redirect_stdout(io.StringIO()):
-                result = await ingest(pdf, Settings(root / "data"))
+                result = await RagPipeline(Settings(root / "data", render_dpi=72)).ingest(pdf)
             self.assertEqual(result["page_count"], 50)
             self.assertEqual(result["chunk_count"], 50)
             self.assertEqual(result["status"], "files_only")
             self.assertEqual(result["empty_pages"], [])
             text_path = root / "data" / result["id"] / "pages" / "page_0050" / "page.txt"
             self.assertIn("Page 50", text_path.read_text())
+            import pymupdf
+            image = pymupdf.Pixmap(str(text_path.with_name("page.png")))
+            self.assertEqual((image.width, image.height), (612, 792))
+            page_meta = json.loads(text_path.with_name("page.json").read_text())
+            self.assertTrue(Path(page_meta["image_path"]).exists())
+            self.assertEqual(page_meta["knowledge_status"], "skipped")
+            self.assertEqual(len(list((root / "data" / result["id"]).glob("pages/*/page.png"))), 50)
 
     async def test_50_pages_ordering_and_idempotent_ids(self):
         with tempfile.TemporaryDirectory() as temporary:
