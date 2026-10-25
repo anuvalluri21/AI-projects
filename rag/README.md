@@ -1,5 +1,9 @@
 # Asynchronous PDF knowledge graph
 
+See [ENTITY_SCHEMA.md](ENTITY_SCHEMA.md) for configurable Pydantic node unions,
+indexed dedup rules, and shared canonical hubs. Edit `graph_schema.json` to
+customize node labels and Person identity rules.
+
 `rag.RagPipeline` handles a 50-page PDF (or any page count). It extracts
 each page, splits its text into overlapping character chunks, saves text and
 metadata to local folders, generates OpenAI embeddings, and upserts into
@@ -121,8 +125,8 @@ marked completed only after all chunks and ordering links succeed. A retry
 repairs partial ingestion; it re-embeds chunks and consumes credits again.
 On retry, Neo4j replaces each page's extracted entity graph in a single
 transaction so stale facts are not accumulated. Entities are deliberately
-page-scoped; identical names on two pages remain separate nodes. No cross-page
-entity resolution is performed. Relation predicates are stored as properties
+page-scoped, with separate canonical hubs linked through `REFERS_TO` using
+configured exact dedup rules. Relation predicates are stored as properties
 of `PageRelation` nodes, not interpolated into Cypher relationship types.
 
 ## Reference page images and knowledge later
@@ -247,3 +251,45 @@ Components accept injected replacements so the pipeline can be tested
 without external services. Tests live under `rag/tests/`.
 Keep `asyncio.run()` under the main guard in scripts that render pages, because
 the renderer spawns processes on Windows.
+
+## Select the embedding provider
+
+Both `python -m rag document.pdf` and `python rag_single_file.py document.pdf`
+read `rag/.env` (then the repository `.env` for missing settings). Existing
+process environment variables take precedence. CLI flags override these defaults.
+
+For Pinecone-hosted Llama embeddings and a 1024-dimension index:
+
+```dotenv
+EMBEDDING_PROVIDER=pinecone
+EMBEDDING_MODEL=llama-text-embed-v2
+EMBEDDING_DIMENSION=1024
+PINECONE_API_KEY=your-pinecone-api-key
+PINECONE_INDEX_HOST=your-index-host
+```
+
+For OpenAI embeddings, set `EMBEDDING_PROVIDER=openai`,
+`EMBEDDING_MODEL=text-embedding-3-small`, and `EMBEDDING_DIMENSION=1536`.
+Use an index with the corresponding dimension. Keep different embedding models
+in separate indexes or namespaces, even if their dimensions match; re-ingest
+documents after changing models.
+
+Llama uses Pinecone Inference to embed chunk text as `passage`, then stores the
+returned vectors with chunk metadata. `EmbeddingService.embed(question,
+input_type="query")` generates compatible question vectors. The service checks
+returned dimensions, and startup checks the configured index dimension.
+Provider and dimension are included in document IDs and metadata.
+
+`OPENAI_API_KEY` is still needed for Trustcall page image/entity extraction.
+With Pinecone embeddings and `--skip-entities`, OpenAI credentials are optional.
+Llama is an embedding model here; it does not replace the page reasoning model.
+
+### Pinecone document index writes
+
+The configured index must declare a dense vector field named `embedding` with
+the same dimension as the selected embedding model. Both implementations write
+through `index.documents.upsert()`, using the chunk ID as `_id`, the generated
+vector as `embedding`, and the text as `chunk_text`. Page and document IDs,
+file paths, model, and other chunk metadata are stored as document fields.
+Existing IDs are replaced on repeated ingestion. Legacy vector-only indexes
+using `index.upsert(vectors=...)` are not supported by this write method.

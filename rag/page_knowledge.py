@@ -3,6 +3,7 @@ import asyncio
 import base64
 import hashlib
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from .entity_schema import EntitySchemaConfig
 
 
 class PageEntity(BaseModel):
@@ -56,14 +57,16 @@ class PageKnowledgeExtractor:
 
     def __init__(self):
         self.extractor = None
+        self.schema = PageKnowledge
 
     async def open(self, settings):
         from langchain_openai import ChatOpenAI
         from trustcall import create_extractor
         self.model_name = settings.entity_model
+        self.schema = EntitySchemaConfig.load(settings.schema_config).build_extraction_model(PageEntity, PageKnowledge)
         self.model = ChatOpenAI(model=settings.entity_model, max_retries=2, timeout=90)
         self.extractor = create_extractor(
-            self.model, tools=[PageKnowledge], tool_choice="PageKnowledge"
+            self.model, tools=[self.schema], tool_choice=self.schema.__name__
         )
 
     async def extract(self, page_id, image_path, text):
@@ -84,7 +87,7 @@ class PageKnowledgeExtractor:
         if len(responses) != 1:
             raise ValueError("Trustcall must return exactly one PageKnowledge result")
         response = responses[0]
-        knowledge = PageKnowledge.model_validate(response.model_dump() if isinstance(response, BaseModel) else response)
+        knowledge = self.schema.model_validate(response.model_dump() if isinstance(response, BaseModel) else response)
         return self.attach_references(knowledge, page_id, image_path, self.model_name)
 
     @staticmethod
@@ -92,18 +95,18 @@ class PageKnowledgeExtractor:
         data = knowledge.model_dump()
         entity_ids = {}
         for entity in data["entities"]:
-            key = f"{entity['entity_type'].strip().casefold()}:{entity['name'].strip().casefold()}"
+            key = f"{entity['entity_type']}:{entity['local_id']}"
             entity["id"] = page_id + ":entity:" + hashlib.sha256(key.encode()).hexdigest()[:24]
             entity_ids[entity["local_id"]] = entity["id"]
         if len(set(entity_ids.values())) != len(entity_ids):
-            raise ValueError("Duplicate normalized entities")
+            raise ValueError("Duplicate entity mention identifiers")
         for relation in data["relationships"]:
             relation["source_id"] = entity_ids[relation["source"]]
             relation["target_id"] = entity_ids[relation["target"]]
             key = f"{relation['source_id']}:{relation['predicate']}:{relation['target_id']}"
             relation["id"] = page_id + ":relation:" + hashlib.sha256(key.encode()).hexdigest()[:24]
         return {**data, "page_id": page_id, "image_path": str(image_path),
-                "model": model, "schema_version": "page-knowledge-v1", "status": "extracted"}
+                "model": model, "schema_version": "page-knowledge-v2", "status": "extracted"}
 
     async def close(self):
         # ChatOpenAI owns no open per-page context; close its SDK transports.

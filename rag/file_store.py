@@ -1,6 +1,7 @@
 """Local PDF snapshots and atomic JSON metadata writes."""
 import hashlib
 import json
+from .entity_schema import EntitySchemaConfig
 
 class FileStore:
     @staticmethod
@@ -16,7 +17,8 @@ class FileStore:
         data = source.read_bytes()
         checksum = hashlib.sha256(data).hexdigest()
         config = (f"{checksum}:{settings.chunk_size}:{settings.overlap}:{settings.embedding_model}:"
-                  f"{settings.render_dpi}:{settings.extract_entities}:{settings.entity_model}:v2")
+                  f"{settings.render_dpi}:{settings.extract_entities}:{settings.entity_model}:"
+                  f"{EntitySchemaConfig.load(settings.schema_config).fingerprint()}:{settings.embedding_provider}:{settings.embedding_dimension}:v4")
         document_id = hashlib.sha256(config.encode()).hexdigest()
         folder = settings.output.resolve() / document_id
         folder.mkdir(parents=True, exist_ok=True)

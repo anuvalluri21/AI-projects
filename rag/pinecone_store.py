@@ -1,4 +1,4 @@
-"""Asynchronous Pinecone vector storage with shared graph IDs."""
+"""Asynchronous Pinecone document storage with vectors and shared graph IDs."""
 import os
 
 
@@ -13,9 +13,9 @@ class PineconeVectorStore:
     async def upsert(self, metadata, text, values):
         if len(values) != self.stats.dimension:
             raise ValueError(f"Pinecone index dimension {self.stats.dimension} does not match embedding dimension {len(values)}")
-        await self.index.upsert(
-            vectors=[{"id": metadata["id"], "values": values,
-                      "metadata": {**metadata, "text": text}}],
+        await self.index.documents.upsert(
+            documents=[{**metadata, "_id": metadata["id"],
+                        "embedding": values, "chunk_text": text}],
             namespace=self.namespace,
         )
 

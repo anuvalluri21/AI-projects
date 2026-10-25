@@ -13,9 +13,12 @@ class Stores:
         self.knowledge = knowledge if knowledge is not None else PageKnowledgeExtractor()
 
     async def open(self, settings):
+        await self.graph.configure(settings)
         await self.graph.open()
-        await self.embeddings.open(settings.embedding_model)
+        await self.embeddings.open(settings.embedding_model, settings.embedding_provider, settings.embedding_dimension)
         await self.vectors.open()
+        if settings.embedding_dimension is not None and self.vectors.stats.dimension != settings.embedding_dimension:
+            raise ValueError(f"Pinecone index dimension {self.vectors.stats.dimension} does not match configured embedding dimension {settings.embedding_dimension}")
         if settings.extract_entities:
             await self.knowledge.open(settings)
 
@@ -27,7 +30,9 @@ class Stores:
 
     async def page_knowledge(self, page_id, image_path, text):
         knowledge = await self.knowledge.extract(page_id, image_path, text)
-        await self.graph.page_knowledge(page_id, knowledge)
+        mapping = await self.graph.page_knowledge(page_id, knowledge)
+        for entity in knowledge["entities"]:
+            entity["canonical_id"] = mapping[entity["id"]]
         return knowledge
 
     async def page_context(self, page_id):

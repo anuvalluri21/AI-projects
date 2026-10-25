@@ -1,6 +1,7 @@
 """Pipeline configuration and validation."""
 from dataclasses import dataclass
 from pathlib import Path
+from .entity_schema import EntitySchemaConfig
 
 @dataclass(frozen=True)
 class Settings:
@@ -13,11 +14,23 @@ class Settings:
     render_dpi: int = 120
     extract_entities: bool = True
     entity_model: str = "gpt-4.1-mini"
+    schema_config: Path | None = None
+
+    embedding_provider: str = "openai"
+    embedding_dimension: int | None = None
 
     def validate(self):
+        if self.embedding_provider not in ("openai", "pinecone"):
+            raise ValueError("embedding_provider must be openai or pinecone")
+        if self.embedding_dimension is not None and self.embedding_dimension < 1:
+            raise ValueError("embedding_dimension must be positive")
+        if self.embedding_model == "llama-text-embed-v2" and self.embedding_provider != "pinecone":
+            raise ValueError("llama-text-embed-v2 requires embedding_provider=pinecone")
         if not 0 <= self.overlap < self.chunk_size:
             raise ValueError("Require 0 <= overlap < chunk_size")
         if self.page_workers < 1 or self.chunk_workers < 1:
             raise ValueError("Worker counts must be positive")
         if not 72 <= self.render_dpi <= 300:
             raise ValueError("render_dpi must be between 72 and 300")
+        if self.schema_config is not None:
+            EntitySchemaConfig.load(self.schema_config)

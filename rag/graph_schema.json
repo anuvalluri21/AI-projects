@@ -1,0 +1,109 @@
+{
+  "namespace": "project_knowledge",
+  "node_types": {
+    "Person": {
+      "hub": "Person",
+      "description": "A person mentioned in the document",
+      "properties": {
+        "email": {
+          "type": "string",
+          "normalizer": "email",
+          "required": false
+        },
+        "phone": {
+          "type": "string",
+          "normalizer": "phone",
+          "required": false
+        }
+      }
+    },
+    "Employee": {
+      "hub": "Person",
+      "description": "A person explicitly identified as an employee",
+      "properties": {
+        "email": {
+          "type": "string",
+          "normalizer": "email",
+          "required": false
+        },
+        "phone": {
+          "type": "string",
+          "normalizer": "phone",
+          "required": false
+        }
+      }
+    },
+    "Organization": {
+      "hub": "Organization",
+      "description": "",
+      "properties": {
+        "domain": {
+          "type": "string",
+          "normalizer": "casefold",
+          "required": false
+        }
+      }
+    },
+    "Equipment": {
+      "hub": "Equipment",
+      "description": "",
+      "properties": {
+        "asset_tag": {
+          "type": "string",
+          "normalizer": "casefold",
+          "required": false
+        }
+      }
+    }
+  },
+  "dedup": {
+    "Person": {
+      "any_of": [
+        {
+          "fields": [
+            "email"
+          ]
+        },
+        {
+          "fields": [
+            "phone"
+          ]
+        },
+        {
+          "fields": [
+            "name"
+          ]
+        }
+      ],
+      "conflict_fields": [
+        "email",
+        "phone"
+      ]
+    },
+    "Organization": {
+      "any_of": [
+        {
+          "fields": [
+            "name"
+          ]
+        }
+      ],
+      "conflict_fields": []
+    },
+    "Equipment": {
+      "any_of": [
+        {
+          "fields": [
+            "asset_tag"
+          ]
+        },
+        {
+          "fields": [
+            "name"
+          ]
+        }
+      ],
+      "conflict_fields": []
+    }
+  }
+}

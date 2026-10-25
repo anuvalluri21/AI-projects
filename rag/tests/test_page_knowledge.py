@@ -9,10 +9,11 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from pydantic import ValidationError
-from rag.page_knowledge import PageKnowledge, PageKnowledgeExtractor
+from rag.page_knowledge import PageEntity, PageKnowledge, PageKnowledgeExtractor
 from rag.neo4j_store import Neo4jGraphStore
 from rag.pipeline import RagPipeline
 from rag.settings import Settings
+from rag.entity_schema import EntitySchemaConfig
 from rag.tests.test_pipeline import FakeRenderer, FakeStores
 
 
@@ -63,7 +64,7 @@ class PageKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         invalid["relationships"][0]["target"] = "missing"
         model = ToolModel(responses=[
             AIMessage(content="", tool_calls=[
-                {"name": "PageKnowledge", "args": invalid, "id": "call_offline"}
+                {"name": "ConfiguredPageKnowledge", "args": invalid, "id": "call_offline"}
             ]),
             AIMessage(content="", tool_calls=[{
                 "name": "PatchFunctionErrors", "id": "repair_offline",
@@ -73,7 +74,8 @@ class PageKnowledgeTests(unittest.IsolatedAsyncioTestCase):
         ])
         service = PageKnowledgeExtractor()
         service.model_name = "offline-fake-model"
-        service.extractor = create_extractor(model, tools=[PageKnowledge], tool_choice="PageKnowledge")
+        service.schema = EntitySchemaConfig.default().build_extraction_model(PageEntity, PageKnowledge)
+        service.extractor = create_extractor(model, tools=[service.schema], tool_choice=service.schema.__name__)
         with tempfile.TemporaryDirectory() as temporary:
             png = Path(temporary) / "page.png"
             png.write_bytes(b"fake-image-for-mocked-model")
@@ -123,6 +125,7 @@ class PageKnowledgeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_neo4j_replaces_page_graph_in_one_transaction(self):
         graph = Neo4jGraphStore()
+        graph.resolver = AsyncMock()
         graph.database = "neo4j"
         graph.driver = MagicMock()
         session, transaction = AsyncMock(), AsyncMock()

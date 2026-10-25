@@ -33,6 +33,8 @@ class RagPipeline:
             "source_path": str(snapshot), "page_count": count, "status": "ingesting",
             "chunk_size": settings.chunk_size, "overlap": settings.overlap,
             "embedding_model": settings.embedding_model,
+                "embedding_provider": settings.embedding_provider,
+                **({"embedding_dimension": settings.embedding_dimension} if settings.embedding_dimension is not None else {}),
             "render_dpi": settings.render_dpi, "entity_extraction": bool(stores and settings.extract_entities),
             "entity_model": settings.entity_model,
         }

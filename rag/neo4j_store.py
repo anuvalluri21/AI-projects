@@ -1,7 +1,15 @@
 """Neo4j document, page, chunk, and ordering relationships."""
 import os
+from .entity_schema import EntitySchemaConfig
+from .entity_resolver import EntityResolver
 
 class Neo4jGraphStore:
+    def __init__(self):
+        self.resolver = EntityResolver(EntitySchemaConfig.default())
+
+    async def configure(self, settings):
+        self.resolver = EntityResolver(EntitySchemaConfig.load(settings.schema_config))
+
     async def open(self):
         from neo4j import AsyncGraphDatabase
         self.driver = AsyncGraphDatabase.driver(
@@ -10,8 +18,11 @@ class Neo4jGraphStore:
         )
         self.database = os.getenv("NEO4J_DATABASE", "neo4j")
         await self.driver.verify_connectivity()
-        for label in ("Document", "Page", "Chunk", "PageEntity", "PageRelation"):
+        for label in ("Document", "Page", "Chunk", "PageEntity", "PageRelation", "CanonicalEntity", "EntityWriteLock"):
             await self.query(f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.id IS UNIQUE")
+        for query in self.resolver.index_queries():
+            await self.query(query)
+        await self.query("CALL db.awaitIndexes(120)")
 
     async def query(self, cypher, **parameters):
         return await self.driver.execute_query(
@@ -43,6 +54,7 @@ class Neo4jGraphStore:
                       "model": knowledge["model"]} for relation in knowledge["relationships"]]
 
         async def replace(tx):
+            await self.resolver.acquire_locks(tx, entities)
             queries = [
                 ("MATCH (r:PageRelation {page_id:$page}) DETACH DELETE r", {}),
                 ("MATCH (e:PageEntity {page_id:$page}) DETACH DELETE e", {}),
@@ -58,17 +70,32 @@ class Neo4jGraphStore:
             for query, params in queries:
                 result = await tx.run(query, page=page_id, **params)
                 await result.consume()
+            mapping = {}
+            for entity in entities:
+                mapping[entity["id"]] = await self.resolver.resolve(tx, entity)
+            return mapping
 
         async with self.driver.session(database=self.database) as session:
-            await session.execute_write(replace)
+            return await session.execute_write(replace)
 
     async def page_context(self, page_id):
         records, _, _ = await self.query(
             "MATCH (p:Page {id:$page}) "
             "OPTIONAL MATCH (p)-[:MENTIONS]->(e:PageEntity) "
             "OPTIONAL MATCH (p)-[:HAS_RELATION]->(r:PageRelation) "
-            "RETURN p{.*, entities:collect(DISTINCT e{.*}), "
-            "relationships:collect(DISTINCT r{.*})} AS context", page=page_id
+            "WITH p, collect(DISTINCT e{.*}) AS entities, "
+            "collect(DISTINCT r{.*}) AS relationships "
+            "RETURN p{.*, entities:entities, relationships:relationships} AS context", page=page_id
+        )
+        return records[0]["context"] if records else None
+
+    async def canonical_context(self, canonical_id):
+        records, _, _ = await self.query(
+            "MATCH (c:CanonicalEntity {id:$id}) "
+            "OPTIONAL MATCH (p:Page)-[:MENTIONS]->(m:PageEntity)-[:REFERS_TO]->(c) "
+            "WITH c, collect(m{.*, image_path:p.image_path, page_id:p.id}) AS mentions "
+            "RETURN c{.*, mentions:mentions} AS context",
+            id=canonical_id,
         )
         return records[0]["context"] if records else None
 

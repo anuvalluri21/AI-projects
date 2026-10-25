@@ -11,12 +11,226 @@ import base64
 import hashlib
 import json
 import os
+import re
+import unicodedata
+import uuid
+from typing import Annotated, Literal, Union
 from dataclasses import dataclass
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
+
+
+# Components from entity_schema.py
+class EntityProperty(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["string", "integer", "number", "boolean"] = "string"
+    normalizer: Literal["name", "email", "phone", "casefold", "exact"] = "exact"
+    required: bool = False
+
+class EntityType(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    hub: str
+    description: str = ""
+    properties: dict[str, EntityProperty] = Field(default_factory=dict)
+
+class DedupRule(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fields: list[str] = Field(min_length=1)
+
+class HubRules(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    any_of: list[DedupRule] = Field(min_length=1)
+    conflict_fields: list[str] = Field(default_factory=list)
+
+class EntitySchemaConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    namespace: str = Field(min_length=1, max_length=100)
+    node_types: dict[str, EntityType] = Field(min_length=1, max_length=30)
+    dedup: dict[str, HubRules]
+
+    @model_validator(mode="after")
+    def validate_schema(self):
+        reserved = {"id", "scope", "display_name", "created_at", "updated_at", "local_id", "evidence", "entity_type"}
+        reserved_labels = {"Document", "Page", "Chunk", "PageEntity", "PageRelation", "CanonicalEntity", "EntityWriteLock"}
+        for label, definition in self.node_types.items():
+            for identifier in (label, definition.hub, *definition.properties):
+                if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", identifier):
+                    raise ValueError(f"Invalid Cypher identifier: {identifier}")
+            if label in reserved_labels or definition.hub in reserved_labels:
+                raise ValueError("Entity labels must not use reserved graph labels")
+            if reserved.intersection(definition.properties):
+                raise ValueError("Entity properties must not use reserved metadata fields")
+            if "name" in definition.properties:
+                raise ValueError("name is a built-in required field")
+            if any(p.normalizer != "exact" and p.type != "string" for p in definition.properties.values()):
+                raise ValueError("Text normalizers require string properties")
+            if definition.hub not in self.dedup:
+                raise ValueError(f"Missing dedup rules for {definition.hub}")
+            available = {"name", *definition.properties}
+            rules = self.dedup[definition.hub]
+            for fields in [r.fields for r in rules.any_of] + [rules.conflict_fields]:
+                if len(fields) != len(set(fields)) or not set(fields) <= available:
+                    raise ValueError(f"Invalid dedup fields for {label}")
+        if set(self.dedup) != {n.hub for n in self.node_types.values()}:
+            raise ValueError("Dedup hubs must match configured node hubs")
+        # A shared hub must use the same field representation for every subtype.
+        for hub in self.dedup:
+            members = [v for v in self.node_types.values() if v.hub == hub]
+            fields = {f for r in self.dedup[hub].any_of for f in r.fields} | set(self.dedup[hub].conflict_fields)
+            for field in fields - {"name"}:
+                representations = {(m.properties[field].type, m.properties[field].normalizer) for m in members}
+                if len(representations) != 1:
+                    raise ValueError(f"Shared hub {hub} needs consistent normalization for {field}")
+        return self
+
+    @classmethod
+    def default(cls):
+        return cls.model_validate({
+            "namespace": "project_knowledge",
+            "node_types": {
+                "Person": {"hub": "Person", "description": "A person mentioned in the document", "properties": {
+                    "email": {"normalizer": "email"}, "phone": {"normalizer": "phone"}}},
+                "Employee": {"hub": "Person", "description": "A person explicitly identified as an employee", "properties": {
+                    "email": {"normalizer": "email"}, "phone": {"normalizer": "phone"}}},
+                "Organization": {"hub": "Organization", "properties": {"domain": {"normalizer": "casefold"}}},
+                "Equipment": {"hub": "Equipment", "properties": {"asset_tag": {"normalizer": "casefold"}}},
+            },
+            "dedup": {
+                "Person": {"any_of": [{"fields": ["email"]}, {"fields": ["phone"]}, {"fields": ["name"]}],
+                           "conflict_fields": ["email", "phone"]},
+                "Organization": {"any_of": [{"fields": ["name"]}]},
+                "Equipment": {"any_of": [{"fields": ["asset_tag"]}, {"fields": ["name"]}]},
+            },
+        })
+
+    @classmethod
+    def load(cls, path=None):
+        return cls.model_validate_json(Path(path).read_text(encoding="utf-8")) if path else cls.default()
+
+    def fingerprint(self):
+        return hashlib.sha256(json.dumps(self.model_dump(), sort_keys=True).encode()).hexdigest()
+
+    def build_extraction_model(self, entity_base, knowledge_base):
+        """LLM selects a typed node through the entity_type discriminator."""
+        types = {"string": str, "integer": int, "number": float, "boolean": bool}
+        models = []
+        for label, definition in self.node_types.items():
+            fields = {"entity_type": (Literal[label], Field(..., description=definition.description or label))}
+            for name, prop in definition.properties.items():
+                annotation = types[prop.type]
+                fields[name] = (annotation if prop.required else annotation | None,
+                                Field(... if prop.required else None, description=f"Observed {name}; do not infer missing values"))
+            models.append(create_model(f"Extracted{label}", __base__=entity_base, **fields))
+        entity_union = Annotated[Union[tuple(models)], Field(discriminator="entity_type")] if len(models) > 1 else models[0]
+        return create_model("ConfiguredPageKnowledge", __base__=knowledge_base,
+                            entities=(list[entity_union], Field(..., max_length=100)))
+
+    @staticmethod
+    def normalize(value, mode):
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return value
+        value = unicodedata.normalize("NFKC", value).strip()
+        if not value:
+            return None
+        if mode == "phone":
+            # No guessed country codes: only complete international numbers match.
+            value = re.sub(r"[\s().-]", "", value)
+            return value if re.fullmatch(r"\+[1-9][0-9]{6,14}", value) else None
+        if mode == "email":
+            return value.casefold() if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value) else None
+        return " ".join(value.split()).casefold() if mode in ("name", "casefold") else value
+
+    def canonical_properties(self, entity):
+        definition = self.node_types[entity["entity_type"]]
+        props = {"name": self.normalize(entity["name"], "name")}
+        for name, prop in definition.properties.items():
+            value = self.normalize(entity.get(name), prop.normalizer)
+            if value is not None:
+                props[name] = value
+        return {key: value for key, value in props.items() if value is not None}
+
+
+# Components from entity_resolver.py
+class EntityConflictError(ValueError):
+    """The configured identity rules cannot safely select one canonical hub."""
+
+class EntityResolver:
+    def __init__(self, schema):
+        self.schema = schema
+
+    def index_queries(self):
+        queries = []
+        seen = set()
+        for label, definition in self.schema.node_types.items():
+            for indexed_label in (label, definition.hub):
+                for rule in self.schema.dedup[definition.hub].any_of:
+                    key = (indexed_label, tuple(rule.fields))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    suffix = hashlib.sha256(repr(key).encode()).hexdigest()[:16]
+                    fields = ", ".join(f"n.`{field}`" for field in ["scope", *rule.fields])
+                    queries.append(f"CREATE INDEX rag_identity_{suffix} IF NOT EXISTS "
+                                   f"FOR (n:`{indexed_label}`) ON ({fields})")
+        return queries
+
+    async def acquire_locks(self, tx, entities):
+        # All ingestion processes must use these locks. Sorted order avoids lock cycles.
+        hubs = sorted({self.schema.node_types[e["entity_type"]].hub for e in entities})
+        for hub in hubs:
+            result = await tx.run(
+                "MERGE (l:EntityWriteLock {id:$id}) SET l.version=coalesce(l.version,0)+1",
+                id=self.schema.namespace + ":" + hub,
+            )
+            await result.consume()
+
+    async def resolve(self, tx, mention):
+        label = mention["entity_type"]
+        if label not in self.schema.node_types:
+            raise ValueError(f"Unconfigured entity label: {label}")
+        definition = self.schema.node_types[label]
+        hub = definition.hub
+        rules = self.schema.dedup[hub]
+        props = self.schema.canonical_properties(mention)
+        candidates = {}
+        for rule in rules.any_of:
+            if not all(field in props for field in rule.fields):
+                continue
+            predicate = " AND ".join(f"c.`{field}` = ${field}" for field in rule.fields)
+            index_fields = ", ".join(f"`{field}`" for field in ["scope", *rule.fields])
+            result = await tx.run(
+                f"MATCH (c:CanonicalEntity:`{hub}`) USING INDEX c:`{hub}`({index_fields}) "
+                f"WHERE c.scope=$scope AND {predicate} "
+                "RETURN c{.*} AS entity LIMIT 2",
+                scope=self.schema.namespace, **{field: props[field] for field in rule.fields},
+            )
+            for record in await result.data():
+                candidate = record["entity"]
+                candidates[candidate["id"]] = candidate
+        if len(candidates) > 1:
+            raise EntityConflictError("Dedup rules matched multiple canonical entities; review the page and rules")
+        candidate = next(iter(candidates.values()), None)
+        if candidate:
+            for field in rules.conflict_fields:
+                if field in props and candidate.get(field) is not None and candidate[field] != props[field]:
+                    raise EntityConflictError(f"Conflicting {field} on a dedup match; no nodes were merged")
+        canonical_id = candidate["id"] if candidate else "entity:" + uuid.uuid4().hex
+        result = await tx.run(
+            f"MERGE (c:CanonicalEntity:`{hub}` {{id:$id}}) "
+            f"ON CREATE SET c.created_at=datetime() SET c:`{label}`, c.scope=$scope, "
+            "c += $props, c.display_name=$name, c.updated_at=datetime() "
+            "WITH c MATCH (m:PageEntity {id:$mention}) SET m.canonical_id=c.id "
+            "MERGE (m)-[:REFERS_TO]->(c)",
+            id=canonical_id, scope=self.schema.namespace, props=props,
+            name=mention["name"], mention=mention["id"],
+        )
+        await result.consume()
+        return canonical_id
 
 
 # Components from settings.py
@@ -31,14 +245,26 @@ class Settings:
     render_dpi: int = 120
     extract_entities: bool = True
     entity_model: str = "gpt-4.1-mini"
+    schema_config: Path | None = None
+
+    embedding_provider: str = "openai"
+    embedding_dimension: int | None = None
 
     def validate(self):
+        if self.embedding_provider not in ("openai", "pinecone"):
+            raise ValueError("embedding_provider must be openai or pinecone")
+        if self.embedding_dimension is not None and self.embedding_dimension < 1:
+            raise ValueError("embedding_dimension must be positive")
+        if self.embedding_model == "llama-text-embed-v2" and self.embedding_provider != "pinecone":
+            raise ValueError("llama-text-embed-v2 requires embedding_provider=pinecone")
         if not 0 <= self.overlap < self.chunk_size:
             raise ValueError("Require 0 <= overlap < chunk_size")
         if self.page_workers < 1 or self.chunk_workers < 1:
             raise ValueError("Worker counts must be positive")
         if not 72 <= self.render_dpi <= 300:
             raise ValueError("render_dpi must be between 72 and 300")
+        if self.schema_config is not None:
+            EntitySchemaConfig.load(self.schema_config)
 
 
 # Components from pdf_extractor.py
@@ -134,14 +360,16 @@ class PageKnowledgeExtractor:
 
     def __init__(self):
         self.extractor = None
+        self.schema = PageKnowledge
 
     async def open(self, settings):
         from langchain_openai import ChatOpenAI
         from trustcall import create_extractor
         self.model_name = settings.entity_model
+        self.schema = EntitySchemaConfig.load(settings.schema_config).build_extraction_model(PageEntity, PageKnowledge)
         self.model = ChatOpenAI(model=settings.entity_model, max_retries=2, timeout=90)
         self.extractor = create_extractor(
-            self.model, tools=[PageKnowledge], tool_choice="PageKnowledge"
+            self.model, tools=[self.schema], tool_choice=self.schema.__name__
         )
 
     async def extract(self, page_id, image_path, text):
@@ -162,7 +390,7 @@ class PageKnowledgeExtractor:
         if len(responses) != 1:
             raise ValueError("Trustcall must return exactly one PageKnowledge result")
         response = responses[0]
-        knowledge = PageKnowledge.model_validate(response.model_dump() if isinstance(response, BaseModel) else response)
+        knowledge = self.schema.model_validate(response.model_dump() if isinstance(response, BaseModel) else response)
         return self.attach_references(knowledge, page_id, image_path, self.model_name)
 
     @staticmethod
@@ -170,18 +398,18 @@ class PageKnowledgeExtractor:
         data = knowledge.model_dump()
         entity_ids = {}
         for entity in data["entities"]:
-            key = f"{entity['entity_type'].strip().casefold()}:{entity['name'].strip().casefold()}"
+            key = f"{entity['entity_type']}:{entity['local_id']}"
             entity["id"] = page_id + ":entity:" + hashlib.sha256(key.encode()).hexdigest()[:24]
             entity_ids[entity["local_id"]] = entity["id"]
         if len(set(entity_ids.values())) != len(entity_ids):
-            raise ValueError("Duplicate normalized entities")
+            raise ValueError("Duplicate entity mention identifiers")
         for relation in data["relationships"]:
             relation["source_id"] = entity_ids[relation["source"]]
             relation["target_id"] = entity_ids[relation["target"]]
             key = f"{relation['source_id']}:{relation['predicate']}:{relation['target_id']}"
             relation["id"] = page_id + ":relation:" + hashlib.sha256(key.encode()).hexdigest()[:24]
         return {**data, "page_id": page_id, "image_path": str(image_path),
-                "model": model, "schema_version": "page-knowledge-v1", "status": "extracted"}
+                "model": model, "schema_version": "page-knowledge-v2", "status": "extracted"}
 
     async def close(self):
         # ChatOpenAI owns no open per-page context; close its SDK transports.
@@ -234,7 +462,8 @@ class FileStore:
         data = source.read_bytes()
         checksum = hashlib.sha256(data).hexdigest()
         config = (f"{checksum}:{settings.chunk_size}:{settings.overlap}:{settings.embedding_model}:"
-                  f"{settings.render_dpi}:{settings.extract_entities}:{settings.entity_model}:v2")
+                  f"{settings.render_dpi}:{settings.extract_entities}:{settings.entity_model}:"
+                  f"{EntitySchemaConfig.load(settings.schema_config).fingerprint()}:{settings.embedding_provider}:{settings.embedding_dimension}:v4")
         document_id = hashlib.sha256(config.encode()).hexdigest()
         folder = settings.output.resolve() / document_id
         folder.mkdir(parents=True, exist_ok=True)
@@ -263,14 +492,35 @@ class AsyncExecutor:
 
 # Components from embedding_service.py
 class EmbeddingService:
-    async def open(self, model):
-        from openai import AsyncOpenAI
+    async def open(self, model, provider="openai", dimension=None):
         self.model = model
-        self.client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], max_retries=3, timeout=60)
+        self.provider = provider
+        self.dimension = dimension
+        if provider == "pinecone":
+            from pinecone import AsyncPinecone
+            self.client = AsyncPinecone(api_key=os.environ["PINECONE_API_KEY"])
+        elif provider == "openai":
+            from openai import AsyncOpenAI
+            self.client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], max_retries=3, timeout=60)
+        else:
+            raise ValueError("Embedding provider must be openai or pinecone")
 
-    async def embed(self, text):
-        result = await self.client.embeddings.create(model=self.model, input=text)
-        return result.data[0].embedding
+    async def embed(self, text, input_type="passage"):
+        if input_type not in ("passage", "query"):
+            raise ValueError("input_type must be passage or query")
+        if self.provider == "pinecone":
+            parameters = {"input_type": input_type}
+            if self.dimension is not None:
+                parameters["dimension"] = self.dimension
+            result = await self.client.inference.embed(model=self.model, inputs=[text], parameters=parameters)
+            values = result[0].values
+        else:
+            options = {"dimensions": self.dimension} if self.dimension is not None else {}
+            result = await self.client.embeddings.create(model=self.model, input=text, **options)
+            values = result.data[0].embedding
+        if self.dimension is not None and len(values) != self.dimension:
+            raise ValueError(f"Expected {self.dimension} embedding dimensions; received {len(values)}")
+        return values
 
     async def close(self):
         if hasattr(self, "client"):
@@ -279,6 +529,12 @@ class EmbeddingService:
 
 # Components from neo4j_store.py
 class Neo4jGraphStore:
+    def __init__(self):
+        self.resolver = EntityResolver(EntitySchemaConfig.default())
+
+    async def configure(self, settings):
+        self.resolver = EntityResolver(EntitySchemaConfig.load(settings.schema_config))
+
     async def open(self):
         from neo4j import AsyncGraphDatabase
         self.driver = AsyncGraphDatabase.driver(
@@ -287,8 +543,11 @@ class Neo4jGraphStore:
         )
         self.database = os.getenv("NEO4J_DATABASE", "neo4j")
         await self.driver.verify_connectivity()
-        for label in ("Document", "Page", "Chunk", "PageEntity", "PageRelation"):
+        for label in ("Document", "Page", "Chunk", "PageEntity", "PageRelation", "CanonicalEntity", "EntityWriteLock"):
             await self.query(f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.id IS UNIQUE")
+        for query in self.resolver.index_queries():
+            await self.query(query)
+        await self.query("CALL db.awaitIndexes(120)")
 
     async def query(self, cypher, **parameters):
         return await self.driver.execute_query(
@@ -320,6 +579,7 @@ class Neo4jGraphStore:
                       "model": knowledge["model"]} for relation in knowledge["relationships"]]
 
         async def replace(tx):
+            await self.resolver.acquire_locks(tx, entities)
             queries = [
                 ("MATCH (r:PageRelation {page_id:$page}) DETACH DELETE r", {}),
                 ("MATCH (e:PageEntity {page_id:$page}) DETACH DELETE e", {}),
@@ -335,17 +595,32 @@ class Neo4jGraphStore:
             for query, params in queries:
                 result = await tx.run(query, page=page_id, **params)
                 await result.consume()
+            mapping = {}
+            for entity in entities:
+                mapping[entity["id"]] = await self.resolver.resolve(tx, entity)
+            return mapping
 
         async with self.driver.session(database=self.database) as session:
-            await session.execute_write(replace)
+            return await session.execute_write(replace)
 
     async def page_context(self, page_id):
         records, _, _ = await self.query(
             "MATCH (p:Page {id:$page}) "
             "OPTIONAL MATCH (p)-[:MENTIONS]->(e:PageEntity) "
             "OPTIONAL MATCH (p)-[:HAS_RELATION]->(r:PageRelation) "
-            "RETURN p{.*, entities:collect(DISTINCT e{.*}), "
-            "relationships:collect(DISTINCT r{.*})} AS context", page=page_id
+            "WITH p, collect(DISTINCT e{.*}) AS entities, "
+            "collect(DISTINCT r{.*}) AS relationships "
+            "RETURN p{.*, entities:entities, relationships:relationships} AS context", page=page_id
+        )
+        return records[0]["context"] if records else None
+
+    async def canonical_context(self, canonical_id):
+        records, _, _ = await self.query(
+            "MATCH (c:CanonicalEntity {id:$id}) "
+            "OPTIONAL MATCH (p:Page)-[:MENTIONS]->(m:PageEntity)-[:REFERS_TO]->(c) "
+            "WITH c, collect(m{.*, image_path:p.image_path, page_id:p.id}) AS mentions "
+            "RETURN c{.*, mentions:mentions} AS context",
+            id=canonical_id,
         )
         return records[0]["context"] if records else None
 
@@ -375,9 +650,9 @@ class PineconeVectorStore:
     async def upsert(self, metadata, text, values):
         if len(values) != self.stats.dimension:
             raise ValueError(f"Pinecone index dimension {self.stats.dimension} does not match embedding dimension {len(values)}")
-        await self.index.upsert(
-            vectors=[{"id": metadata["id"], "values": values,
-                      "metadata": {**metadata, "text": text}}],
+        await self.index.documents.upsert(
+            documents=[{**metadata, "_id": metadata["id"],
+                        "embedding": values, "chunk_text": text}],
             namespace=self.namespace,
         )
 
@@ -399,9 +674,12 @@ class Stores:
         self.knowledge = knowledge if knowledge is not None else PageKnowledgeExtractor()
 
     async def open(self, settings):
+        await self.graph.configure(settings)
         await self.graph.open()
-        await self.embeddings.open(settings.embedding_model)
+        await self.embeddings.open(settings.embedding_model, settings.embedding_provider, settings.embedding_dimension)
         await self.vectors.open()
+        if settings.embedding_dimension is not None and self.vectors.stats.dimension != settings.embedding_dimension:
+            raise ValueError(f"Pinecone index dimension {self.vectors.stats.dimension} does not match configured embedding dimension {settings.embedding_dimension}")
         if settings.extract_entities:
             await self.knowledge.open(settings)
 
@@ -413,7 +691,9 @@ class Stores:
 
     async def page_knowledge(self, page_id, image_path, text):
         knowledge = await self.knowledge.extract(page_id, image_path, text)
-        await self.graph.page_knowledge(page_id, knowledge)
+        mapping = await self.graph.page_knowledge(page_id, knowledge)
+        for entity in knowledge["entities"]:
+            entity["canonical_id"] = mapping[entity["id"]]
         return knowledge
 
     async def page_context(self, page_id):
@@ -466,6 +746,8 @@ class ChunkProcessor:
                 "page_number": number, "chunk_number": position,
                 "start_char": chunk["start"], "end_char": chunk["end"],
                 "text_path": str(chunk_path), "embedding_model": settings.embedding_model,
+                "embedding_provider": settings.embedding_provider,
+                **({"embedding_dimension": settings.embedding_dimension} if settings.embedding_dimension is not None else {}),
                 "page_image_path": str(page_folder / "page.png"),
                 "page_knowledge_path": str(page_folder / "knowledge.json"),
             }
@@ -584,6 +866,8 @@ class RagPipeline:
             "source_path": str(snapshot), "page_count": count, "status": "ingesting",
             "chunk_size": settings.chunk_size, "overlap": settings.overlap,
             "embedding_model": settings.embedding_model,
+                "embedding_provider": settings.embedding_provider,
+                **({"embedding_dimension": settings.embedding_dimension} if settings.embedding_dimension is not None else {}),
             "render_dpi": settings.render_dpi, "entity_extraction": bool(stores and settings.extract_entities),
             "entity_model": settings.entity_model,
         }
@@ -644,20 +928,34 @@ async def main():
     parser.add_argument("--overlap", type=int, default=200)
     parser.add_argument("--page-workers", type=int, default=5)
     parser.add_argument("--chunk-workers", type=int, default=8)
-    parser.add_argument("--embedding-model", default="text-embedding-3-small")
+    parser.add_argument("--embedding-provider", choices=("openai", "pinecone"), default=os.getenv("EMBEDDING_PROVIDER", "openai"))
+    parser.add_argument("--embedding-model", default=os.getenv("EMBEDDING_MODEL"))
+    parser.add_argument("--embedding-dimension", type=int, default=os.getenv("EMBEDDING_DIMENSION") or None)
     parser.add_argument("--render-dpi", type=int, default=120)
     parser.add_argument("--entity-model", default="gpt-4.1-mini")
     parser.add_argument("--skip-entities", action="store_true", help="Skip Trustcall page knowledge extraction")
+    default_schema = Path(__file__).with_name("graph_schema.json")
+    if not default_schema.exists():
+        default_schema = Path(__file__).resolve().parent / "rag" / "graph_schema.json"
+    parser.add_argument("--schema-config", type=Path, default=default_schema if default_schema.exists() else None,
+                        help="JSON file defining node types, shared hubs, and dedup rules")
     parser.add_argument("--files-only", action="store_true", help="Skip Neo4j and embeddings")
     args = parser.parse_args()
     if not args.pdf.is_file():
         parser.error("PDF file does not exist")
+    model = args.embedding_model or ("llama-text-embed-v2" if args.embedding_provider == "pinecone" else "text-embedding-3-small")
+    dimension = args.embedding_dimension
+    if dimension is None and model == "llama-text-embed-v2":
+        dimension = 1024
     settings = Settings(args.output, args.chunk_size, args.overlap, args.page_workers, args.chunk_workers,
-                        args.embedding_model, args.render_dpi, not args.skip_entities, args.entity_model)
+                        model, args.render_dpi, not args.skip_entities, args.entity_model, args.schema_config,
+                        args.embedding_provider, dimension)
     settings.validate()
     stores = None
     if not args.files_only:
-        required = ("OPENAI_API_KEY", "NEO4J_URI", "NEO4J_PASSWORD", "PINECONE_API_KEY", "PINECONE_INDEX_HOST")
+        required = ["NEO4J_URI", "NEO4J_PASSWORD", "PINECONE_API_KEY", "PINECONE_INDEX_HOST"]
+        if settings.embedding_provider == "openai" or settings.extract_entities:
+            required.append("OPENAI_API_KEY")
         missing = [key for key in required if not os.getenv(key) or os.getenv(key).startswith("your-")]
         if missing:
             parser.error("Missing configuration: " + ", ".join(missing))

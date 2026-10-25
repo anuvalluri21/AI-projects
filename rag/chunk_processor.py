@@ -31,6 +31,8 @@ class ChunkProcessor:
                 "page_number": number, "chunk_number": position,
                 "start_char": chunk["start"], "end_char": chunk["end"],
                 "text_path": str(chunk_path), "embedding_model": settings.embedding_model,
+                "embedding_provider": settings.embedding_provider,
+                **({"embedding_dimension": settings.embedding_dimension} if settings.embedding_dimension is not None else {}),
                 "page_image_path": str(page_folder / "page.png"),
                 "page_knowledge_path": str(page_folder / "knowledge.json"),
             }
