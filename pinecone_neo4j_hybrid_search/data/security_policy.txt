@@ -1,0 +1,14 @@
+Customer Data Access Policy
+Document ID: security-policy-001
+
+CHUNK 8
+External contractors are classified as third-party users.
+
+CHUNK 24
+Customer data is classified as restricted data.
+
+CHUNK 51
+All users, including third-party users, may download restricted data only to company-managed devices. This requirement is the device restriction.
+
+CHUNK 79
+An exception to the device restriction requires approval from the Security Director before the download occurs.

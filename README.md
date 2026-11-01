@@ -1,5 +1,9 @@
 # AI calculator examples
 
+For a four-chunk policy example combining Pinecone semantic search with
+Neo4j entity traversal, see
+[pinecone_neo4j_hybrid_search](pinecone_neo4j_hybrid_search/README.md).
+
 For asynchronous PDF ingestion into Neo4j and Pinecone, see
 [PDF_KNOWLEDGE_GRAPH.md](PDF_KNOWLEDGE_GRAPH.md).
 

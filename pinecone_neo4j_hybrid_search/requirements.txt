@@ -1,0 +1,4 @@
+pinecone>=10,<11
+neo4j>=5.28,<6
+sentence-transformers>=3,<6
+python-dotenv>=1,<2
