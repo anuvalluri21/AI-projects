@@ -1,5 +1,8 @@
 # Pinecone and Neo4j hybrid document search
 
+See [the end-to-end walkthrough](END_TO_END_FLOW.md) for every project file,
+the ingestion and retrieval flow, and the worked four-chunk policy example.
+
 Retrieve a relevant chunk with Pinecone, then traverse entities across all
 chunks of the same document in Neo4j to collect supporting evidence.
 
